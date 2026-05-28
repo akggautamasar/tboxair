@@ -17,12 +17,13 @@ import os
 import re
 import asyncio
 import time
+import threading
 import logging
 from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import Message
 
 logging.basicConfig(level=logging.INFO)
@@ -170,27 +171,30 @@ async def health(request):
     return web.Response(text="TeraBox bot alive")
 
 
-async def run():
-    # Start the aiohttp keep-alive server first (binds the port Render needs)
-    server = web.Application()
-    server.router.add_get("/", health)
-    server.router.add_get("/health", health)
-    runner = web.AppRunner(server)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info(f"HTTP server on :{PORT}")
+def start_keepalive_server():
+    """Run a tiny HTTP server in a background thread so Render sees an open
+    port and an uptime pinger can keep the instance awake. This runs in its
+    own event loop, separate from Pyrogram's."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-    # Start Pyrogram and keep its update loop alive with idle()
-    await app.start()
-    me = await app.get_me()
-    log.info(f"Bot started as @{me.username}")
+    async def _serve():
+        server = web.Application()
+        server.router.add_get("/", health)
+        server.router.add_get("/health", health)
+        runner = web.AppRunner(server)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        log.info(f"HTTP keep-alive server on :{PORT}")
 
-    await idle()  # <-- this is what keeps Pyrogram polling for updates
-
-    await app.stop()
-    await runner.cleanup()
+    loop.run_until_complete(_serve())
+    loop.run_forever()
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    # Start keep-alive HTTP server in a daemon thread
+    threading.Thread(target=start_keepalive_server, daemon=True).start()
+    # Let Pyrogram own the main thread — app.run() properly starts update fetching
+    log.info("Starting Pyrogram bot...")
+    app.run()
