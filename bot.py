@@ -1,7 +1,7 @@
 """
 TeraBox -> Telegram bot (Option B: native video + file upload via Pyrogram bot session)
 
-Hosting: Render free web service (webhook mode + keep-alive).
+Hosting: Render free web service (polling via Pyrogram + keep-alive HTTP server).
 It calls YOUR Cloudflare worker to resolve the TeraBox link, streams the
 direct CDN download to disk, then uploads to Telegram as both video and file.
 
@@ -10,7 +10,6 @@ Required environment variables (set in Render dashboard):
   API_HASH      - from https://my.telegram.org
   BOT_TOKEN     - from @BotFather
   WORKER_URL    - your worker base, e.g. https://tboxair.worksbeyondworks.workers.dev
-  WEBHOOK_BASE  - your Render external URL, e.g. https://your-bot.onrender.com
   PORT          - provided automatically by Render
 """
 
@@ -23,7 +22,7 @@ from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +32,6 @@ API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
-WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 
 DOWNLOAD_DIR = "/tmp/tbox"
@@ -173,23 +171,25 @@ async def health(request):
 
 
 async def run():
-    await app.start()
-    me = await app.get_me()
-    log.info(f"Bot started as @{me.username}")
-
-    # Minimal HTTP server so Render's web service has a bound port,
-    # and so an external uptime pinger can keep the instance awake.
+    # Start the aiohttp keep-alive server first (binds the port Render needs)
     server = web.Application()
     server.router.add_get("/", health)
     server.router.add_get("/health", health)
-
     runner = web.AppRunner(server)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info(f"HTTP server on :{PORT}")
 
-    await asyncio.Event().wait()
+    # Start Pyrogram and keep its update loop alive with idle()
+    await app.start()
+    me = await app.get_me()
+    log.info(f"Bot started as @{me.username}")
+
+    await idle()  # <-- this is what keeps Pyrogram polling for updates
+
+    await app.stop()
+    await runner.cleanup()
 
 
 if __name__ == "__main__":
