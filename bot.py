@@ -71,7 +71,8 @@ async def resolve_link(session: aiohttp.ClientSession, link: str):
 
 
 async def download_file(session, url, dest, status_msg):
-    """Stream the CDN download to disk with periodic progress edits."""
+    """Stream the CDN download to disk with periodic progress edits.
+    Returns the number of bytes written."""
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.terabox.com/"}
     last_edit = 0
     downloaded = 0
@@ -92,7 +93,21 @@ async def download_file(session, url, dest, status_msg):
                         )
                     except Exception:
                         pass
-    return dest
+    return downloaded
+
+
+def looks_valid(path, expected_size):
+    """A real video should be reasonably large. Tiny files are error pages."""
+    try:
+        actual = os.path.getsize(path)
+    except OSError:
+        return False
+    if actual < 10 * 1024:  # under 10 KB is never a real video
+        return False
+    if expected_size and actual < expected_size * 0.5:
+        # got far less than expected — likely truncated/error
+        return False
+    return True
 
 
 @app.on_message(filters.command("start"))
@@ -119,8 +134,20 @@ async def handle_link(_, m: Message):
             info = await resolve_link(session, link)
             name = info.get("file_name", "video.mp4")
             size = info.get("size_bytes", 0)
-            dl = info.get("direct_link") or info.get("download_link")
-            if not dl:
+
+            # Build an ordered list of candidate download URLs to try.
+            # direct_link is fastest but expires/region-sensitive; download_link
+            # redirects and is more forgiving; proxy_url goes through the worker
+            # with the cookie as a last resort.
+            candidates = []
+            if info.get("direct_link"):
+                candidates.append(("direct", info["direct_link"]))
+            if info.get("download_link"):
+                candidates.append(("download", info["download_link"]))
+            if info.get("proxy_url"):
+                candidates.append(("proxy", info["proxy_url"]))
+
+            if not candidates:
                 await status.edit_text("❌ No download link found.")
                 return
 
@@ -130,11 +157,33 @@ async def handle_link(_, m: Message):
 
             safe_name = re.sub(r"[^\w.\-]", "_", name)
             dest = os.path.join(DOWNLOAD_DIR, safe_name)
-            await download_file(session, dl, dest, status)
+
+            ok = False
+            last_bytes = 0
+            for label, dl in candidates:
+                try:
+                    last_bytes = await download_file(session, dl, dest, status)
+                except Exception as e:
+                    log.warning(f"download via {label} failed: {e}")
+                    continue
+                if looks_valid(dest, size):
+                    ok = True
+                    log.info(f"download OK via {label} ({human(last_bytes)})")
+                    break
+                else:
+                    log.warning(
+                        f"download via {label} looked invalid "
+                        f"({last_bytes} bytes vs expected {size}); trying next"
+                    )
+
+            if not ok:
+                await status.edit_text(
+                    "❌ Couldn't fetch a valid file. The TeraBox link may have "
+                    "expired or be region-locked. Try sending it again."
+                )
+                return
 
         await status.edit_text("⬆️ Uploading to Telegram…")
-
-        thumb = info.get("thumbnail") or None
 
         # Send as streamable video
         try:
